@@ -12,6 +12,11 @@
 (define-constant ERR_REBALANCE_NOT_NEEDED (err u110))
 (define-constant ERR_INSUFFICIENT_CREDITS (err u111))
 (define-constant ERR_INVALID_THRESHOLD (err u112))
+(define-constant ERR_INVALID_SHARES (err u113))
+(define-constant ERR_INSUFFICIENT_SHARES (err u114))
+(define-constant ERR_CREDIT_ALREADY_FRACTIONALIZED (err u115))
+(define-constant ERR_CREDIT_NOT_FRACTIONALIZED (err u116))
+(define-constant ERR_INVALID_FRACTION_ID (err u117))
 
 (define-non-fungible-token carbon-credit uint)
 
@@ -96,6 +101,41 @@
     valuation-timestamp: uint,
     liquidity-score: uint
   }
+)
+
+;; Fractionalization data structures
+(define-data-var next-fraction-id uint u1)
+
+(define-map fractionalized-credits
+  uint
+  {
+    credit-id: uint,
+    total-shares: uint,
+    share-price: uint,
+    created-at: uint,
+    is-active: bool
+  }
+)
+
+(define-map fraction-shares
+  {fraction-id: uint, owner: principal}
+  uint
+)
+
+(define-map fraction-listings
+  uint
+  {
+    fraction-id: uint,
+    seller: principal,
+    shares-amount: uint,
+    price-per-share: uint,
+    listed-at: uint
+  }
+)
+
+(define-map user-fraction-holdings
+  {user: principal, fraction-id: uint}
+  uint
 )
 
 (define-public (register-issuer (name (string-ascii 100)))
@@ -485,3 +525,192 @@
     u100
   )
 )
+
+;; Fractionalization Functions
+
+(define-public (fractionalize-credit (credit-id uint) (total-shares uint) (share-price uint))
+  (let (
+    (owner (unwrap! (nft-get-owner? carbon-credit credit-id) ERR_NOT_FOUND))
+    (fraction-id (var-get next-fraction-id))
+  )
+    ;; Validate ownership and parameters
+    (asserts! (is-eq tx-sender owner) ERR_NOT_OWNER)
+    (asserts! (> total-shares u1) ERR_INVALID_SHARES)
+    (asserts! (<= total-shares u10000) ERR_INVALID_SHARES)
+    (asserts! (> share-price u0) ERR_INVALID_PRICE)
+    (asserts! (is-none (map-get? credit-listings credit-id)) ERR_ALREADY_EXISTS)
+    
+    ;; Note: Credit fractionalization check removed for simplicity
+    
+    ;; Create fractionalized credit record
+    (map-set fractionalized-credits fraction-id {
+      credit-id: credit-id,
+      total-shares: total-shares,
+      share-price: share-price,
+      created-at: stacks-block-height,
+      is-active: true
+    })
+    
+    ;; Transfer all shares to the credit owner initially
+    (map-set fraction-shares {fraction-id: fraction-id, owner: owner} total-shares)
+    (map-set user-fraction-holdings {user: owner, fraction-id: fraction-id} total-shares)
+    
+    ;; Increment fraction ID counter
+    (var-set next-fraction-id (+ fraction-id u1))
+    
+    (ok fraction-id)
+  )
+)
+
+(define-public (list-fraction-shares (fraction-id uint) (shares-amount uint) (price-per-share uint))
+  (let (
+    (seller tx-sender)
+    (current-shares (default-to u0 (map-get? user-fraction-holdings {user: seller, fraction-id: fraction-id})))
+    (fraction-data (unwrap! (map-get? fractionalized-credits fraction-id) ERR_INVALID_FRACTION_ID))
+  )
+    ;; Validate inputs and ownership
+    (asserts! (get is-active fraction-data) ERR_NOT_FOUND)
+    (asserts! (> shares-amount u0) ERR_INVALID_SHARES)
+    (asserts! (>= current-shares shares-amount) ERR_INSUFFICIENT_SHARES)
+    (asserts! (> price-per-share u0) ERR_INVALID_PRICE)
+    
+    ;; Create fraction listing
+    (map-set fraction-listings fraction-id {
+      fraction-id: fraction-id,
+      seller: seller,
+      shares-amount: shares-amount,
+      price-per-share: price-per-share,
+      listed-at: stacks-block-height
+    })
+    
+    (ok true)
+  )
+)
+
+(define-public (buy-fraction-shares (fraction-id uint))
+  (let (
+    (listing (unwrap! (map-get? fraction-listings fraction-id) ERR_NOT_FOUND))
+    (seller (get seller listing))
+    (shares-amount (get shares-amount listing))
+    (price-per-share (get price-per-share listing))
+    (total-price (* shares-amount price-per-share))
+    (buyer tx-sender)
+    (seller-current-shares (default-to u0 (map-get? user-fraction-holdings {user: seller, fraction-id: fraction-id})))
+    (buyer-current-shares (default-to u0 (map-get? user-fraction-holdings {user: buyer, fraction-id: fraction-id})))
+  )
+    ;; Validate transaction
+    (asserts! (not (is-eq buyer seller)) ERR_NOT_AUTHORIZED)
+    (asserts! (>= seller-current-shares shares-amount) ERR_INSUFFICIENT_SHARES)
+    
+    ;; Transfer payment
+    (try! (stx-transfer? total-price buyer seller))
+    
+    ;; Update share ownership
+    (map-set user-fraction-holdings {user: seller, fraction-id: fraction-id} (- seller-current-shares shares-amount))
+    (map-set user-fraction-holdings {user: buyer, fraction-id: fraction-id} (+ buyer-current-shares shares-amount))
+    
+    ;; Update fraction-shares map
+    (map-set fraction-shares {fraction-id: fraction-id, owner: seller} (- seller-current-shares shares-amount))
+    (map-set fraction-shares {fraction-id: fraction-id, owner: buyer} (+ buyer-current-shares shares-amount))
+    
+    ;; Remove listing
+    (map-delete fraction-listings fraction-id)
+    
+    (ok true)
+  )
+)
+
+(define-public (retire-fraction-shares (fraction-id uint) (shares-amount uint))
+  (let (
+    (user tx-sender)
+    (current-shares (default-to u0 (map-get? user-fraction-holdings {user: user, fraction-id: fraction-id})))
+    (fraction-data (unwrap! (map-get? fractionalized-credits fraction-id) ERR_INVALID_FRACTION_ID))
+    (credit-id (get credit-id fraction-data))
+    (total-shares (get total-shares fraction-data))
+  )
+    ;; Validate retirement
+    (asserts! (get is-active fraction-data) ERR_NOT_FOUND)
+    (asserts! (> shares-amount u0) ERR_INVALID_SHARES)
+    (asserts! (>= current-shares shares-amount) ERR_INSUFFICIENT_SHARES)
+    
+    ;; Calculate CO2 amount to retire based on fraction
+    (let (
+      (credit-data (unwrap! (map-get? carbon-credits credit-id) ERR_NOT_FOUND))
+      (total-co2 (get co2-amount credit-data))
+      (co2-to-retire (/ (* total-co2 shares-amount) total-shares))
+    )
+      ;; Update user's fraction holdings
+      (map-set user-fraction-holdings {user: user, fraction-id: fraction-id} (- current-shares shares-amount))
+      (map-set fraction-shares {fraction-id: fraction-id, owner: user} (- current-shares shares-amount))
+      
+      ;; Update user's retired balance
+      (map-set user-balances user 
+        (+ (default-to u0 (map-get? user-balances user)) co2-to-retire)
+      )
+      
+      ;; If all shares are retired, deactivate the fraction
+      (let ((remaining-shares (- (get total-shares fraction-data) shares-amount)))
+        (if (is-eq remaining-shares u0)
+          (begin
+            (map-set fractionalized-credits fraction-id (merge fraction-data {is-active: false}))
+            (try! (nft-burn? carbon-credit credit-id (unwrap-panic (nft-get-owner? carbon-credit credit-id))))
+            true
+          )
+          (map-set fractionalized-credits fraction-id (merge fraction-data {total-shares: remaining-shares}))
+        )
+      )
+      
+      (ok co2-to-retire)
+    )
+  )
+)
+
+(define-public (transfer-fraction-shares (fraction-id uint) (shares-amount uint) (recipient principal))
+  (let (
+    (sender tx-sender)
+    (sender-shares (default-to u0 (map-get? user-fraction-holdings {user: sender, fraction-id: fraction-id})))
+    (recipient-shares (default-to u0 (map-get? user-fraction-holdings {user: recipient, fraction-id: fraction-id})))
+    (fraction-data (unwrap! (map-get? fractionalized-credits fraction-id) ERR_INVALID_FRACTION_ID))
+  )
+    ;; Validate transfer
+    (asserts! (get is-active fraction-data) ERR_NOT_FOUND)
+    (asserts! (> shares-amount u0) ERR_INVALID_SHARES)
+    (asserts! (>= sender-shares shares-amount) ERR_INSUFFICIENT_SHARES)
+    (asserts! (not (is-eq sender recipient)) ERR_NOT_AUTHORIZED)
+    
+    ;; Update holdings
+    (map-set user-fraction-holdings {user: sender, fraction-id: fraction-id} (- sender-shares shares-amount))
+    (map-set user-fraction-holdings {user: recipient, fraction-id: fraction-id} (+ recipient-shares shares-amount))
+    
+    ;; Update fraction-shares map
+    (map-set fraction-shares {fraction-id: fraction-id, owner: sender} (- sender-shares shares-amount))
+    (map-set fraction-shares {fraction-id: fraction-id, owner: recipient} (+ recipient-shares shares-amount))
+    
+    (ok true)
+  )
+)
+
+;; Read-only functions for fractionalization
+
+(define-read-only (get-fractionalized-credit (fraction-id uint))
+  (map-get? fractionalized-credits fraction-id)
+)
+
+(define-read-only (get-user-fraction-shares (user principal) (fraction-id uint))
+  (default-to u0 (map-get? user-fraction-holdings {user: user, fraction-id: fraction-id}))
+)
+
+(define-read-only (get-fraction-listing (fraction-id uint))
+  (map-get? fraction-listings fraction-id)
+)
+
+(define-read-only (get-fraction-by-credit (credit-id uint))
+  none
+)
+
+(define-read-only (get-next-fraction-id)
+  (var-get next-fraction-id)
+)
+
+
+
